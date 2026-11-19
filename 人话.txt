@@ -1,0 +1,15 @@
+# 介绍
+extract_ota是电脑上用的python脚本，用于提取含有fastboot（以下简称fb）全量包zip中的fb，提取出来的两个文件（位于 版本号_images 文件夹内）和restore_fastboot.sh 一起传到手机中
+restore_fastboot.sh 是手机上使用，用于修复fb。脚本内有提取当前系统fb和使用fb产物两种方式（使用root权限的shell打开）
+目前coloros16均带有fb，c17开始隐藏
+# 路径一：当前系统带有fb，升级后系统不带有fb（16升17或之前升级17修复了fb）
+可只传入脚本，然后选择提取当前系统fb
+升级流程：安装新系统（不重启）→安装root到ota后槽位→脚本安装fb→ ** 在设置的升级系统页重启系统（重点） ** 
+# 路径二：当前不带有fb，升级后不带有fb
+前往系统下载下载对应机型的c16全量包，使用py脚本提取fb产物，连带sh传入手机中使用现有产物修复
+# 提示
+1. 一定一定一定重启要在 ** 在设置的升级系统页重启系统 ** （不然会无限重启，然后回落到旧系统）
+2. 目前仅在 * 一加13（PJZ110） * 上测试，其余机型未做测试。用别怕怕别用（
+3. 使用6.2sol配合写，
+GitHub https://github.com/xanthichi/coloros-fastboot-fix
+云盘 https://pan.quark.cn/s/1cc3228c49d6
