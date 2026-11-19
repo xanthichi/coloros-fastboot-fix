@@ -15,7 +15,7 @@ LIMIT = 64 * 1024 * 1024
 def read_exact(stream, size):
     data = stream.read(size)
     if len(data) != size:
-        raise ValueError("Truncated payload")
+        raise ValueError("payload.bin 数据不完整")
     return data
 
 
@@ -29,7 +29,7 @@ def varint(data, cursor):
         value |= (byte & 127) << shift
         if byte < 128:
             return value, cursor
-    raise ValueError("Invalid manifest varint")
+    raise ValueError("分区清单中的变长整数无效")
 
 
 def fields(data):
@@ -39,7 +39,7 @@ def fields(data):
         tag, cursor = varint(data, cursor)
         number, wire = divmod(tag, 8)
         if not 0 < number < 1 << 29:
-            raise ValueError("Invalid manifest field number")
+            raise ValueError("分区清单中的字段编号无效")
         if wire == 0:
             value, cursor = varint(data, cursor)
         elif wire in (1, 2, 5):
@@ -49,10 +49,10 @@ def fields(data):
                 size = 8 if wire == 1 else 4
             end = cursor + size
             if end > len(data):
-                raise ValueError("Truncated manifest field")
+                raise ValueError("分区清单字段不完整")
             value, cursor = data[cursor:end], end
         else:
-            raise ValueError("Unsupported manifest wire type")
+            raise ValueError("不支持该分区清单字段编码")
         result.setdefault(number, []).append(value)
     return result
 
@@ -62,7 +62,7 @@ def field(message, number, kind, default=None):
     if not values and default is not None:
         return default
     if len(values) != 1 or not isinstance(values[0], kind):
-        raise ValueError(f"Invalid or missing manifest field {number}")
+        raise ValueError(f"分区清单字段 {number} 缺失或无效")
     return values[0]
 
 
@@ -70,20 +70,20 @@ def manifest_from(payload, payload_size):
     magic, version, size, signature_size = struct.unpack(">4sQQI", read_exact(payload, 24))
     data_start = 24 + size + signature_size
     if magic != b"CrAU" or version != 2 or not 0 < size <= LIMIT or data_start > payload_size:
-        raise ValueError("Expected a supported Android OTA v2 payload")
+        raise ValueError("需要有效且受支持的 Android OTA v2 payload.bin")
     manifest = fields(read_exact(payload, size))
     block_size = field(manifest, 3, int, 4096)
     if not 0 < block_size <= LIMIT or block_size & (block_size - 1):
-        raise ValueError("Invalid block size")
+        raise ValueError("分区数据的块大小无效")
     data_size = field(manifest, 4, int, payload_size - data_start)
     if data_size > payload_size - data_start:
-        raise ValueError("Invalid payload data size")
+        raise ValueError("payload.bin 数据区大小无效")
     partitions = {}
     for entry in manifest.get(13, []):
         partition = fields(entry)
         name = field(partition, 1, bytes).decode("utf-8")
         if name in partitions:
-            raise ValueError(f"Duplicate partition: {name}")
+            raise ValueError(f"分区清单中存在重复分区：{name}")
         partitions[name] = partition
     return data_start, data_size, block_size, partitions
 
@@ -93,26 +93,26 @@ def decode_operation(payload, data_start, data_size, operation, output_size):
     offset = field(operation, 2, int, 0)
     length = field(operation, 3, int, 0)
     if operation.get(4) or kind not in (0, 1, 6, 8):
-        raise ValueError(f"Unsupported or source-dependent operation: {kind}")
+        raise ValueError(f"不支持分区操作 {kind}，该操作可能依赖旧分区数据")
     if kind == 6:
         if length:
-            raise ValueError("Unexpected data for ZERO operation")
+            raise ValueError("清零操作包含意外数据")
         return bytes(output_size)
     if not 0 < length <= LIMIT or offset + length > data_size:
-        raise ValueError("Operation extends outside payload data")
+        raise ValueError("分区操作的数据范围超出 payload.bin 数据区")
     payload.seek(data_start + offset)
     data = read_exact(payload, length)
     expected = field(operation, 8, bytes, b"")
     if expected and hashlib.sha256(data).digest() != expected:
-        raise ValueError("Operation data SHA-256 mismatch")
+        raise ValueError("分区操作数据的 SHA-256 不匹配")
     if kind in (1, 8):
         decoder = (bz2.BZ2Decompressor() if kind == 1 else
                    lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=LIMIT))
         data = decoder.decompress(data, max_length=output_size + 1)
         if not decoder.eof or decoder.unused_data:
-            raise ValueError("Invalid compressed operation data")
+            raise ValueError("分区操作的压缩数据无效")
     if len(data) != output_size:
-        raise ValueError("Operation data length does not match its extents")
+        raise ValueError("分区操作的数据长度与目标区间不符")
     return data
 
 
@@ -121,7 +121,7 @@ def build_image(payload, data_start, data_size, block_size, partition):
     size = field(info, 1, int)
     expected = field(info, 2, bytes)
     if partition.get(6) or not 0 < size <= LIMIT or len(expected) != 32:
-        raise ValueError("Expected a full partition image with SHA-256 (up to 64 MiB)")
+        raise ValueError("需要带 SHA-256 的完整分区镜像，每个镜像最多 64 MiB")
     image = bytearray(size)
     ranges = []
     for entry in partition.get(8, []):
@@ -133,11 +133,11 @@ def build_image(payload, data_start, data_size, block_size, partition):
             start = field(extent, 1, int) * block_size
             length = field(extent, 2, int) * block_size
             if not length or start + length > size or output_size + length > size:
-                raise ValueError("Invalid destination extent")
+                raise ValueError("镜像的目标区间无效")
             extents.append((start, length))
             output_size += length
         if not output_size or field(operation, 7, int, output_size) != output_size:
-            raise ValueError("Invalid operation output size")
+            raise ValueError("分区操作的输出大小无效")
         data = decode_operation(payload, data_start, data_size, operation, output_size)
         cursor = 0
         for start, length in extents:
@@ -147,10 +147,10 @@ def build_image(payload, data_start, data_size, block_size, partition):
     end = 0
     for start, next_end in sorted(ranges):
         if start != end:
-            raise ValueError("Missing or overlapping destination extents")
+            raise ValueError("镜像的目标区间存在缺口或重叠")
         end = next_end
     if end != size or hashlib.sha256(image).digest() != expected:
-        raise ValueError("Incomplete image or partition SHA-256 mismatch")
+        raise ValueError("镜像不完整或分区 SHA-256 不匹配")
     return image, expected.hex()
 
 
@@ -158,14 +158,14 @@ def extract(archive_path, output_dir=None, list_only=False):
     with ZipFile(archive_path) as archive:
         entries = [entry for entry in archive.infolist() if entry.filename == "payload.bin"]
         if len(entries) != 1:
-            raise ValueError("Expected one payload.bin at the root of the OTA ZIP")
+            raise ValueError("OTA ZIP 根目录应包含且仅包含一个 payload.bin")
         with archive.open(entries[0]) as payload:
             data_start, data_size, block_size, partitions = manifest_from(payload, entries[0].file_size)
             if list_only:
                 return {name: name in partitions for name in PARTITIONS}
             missing = [name for name in PARTITIONS if name not in partitions]
             if missing:
-                raise ValueError("Missing partitions: " + ", ".join(missing))
+                raise ValueError("更新包缺少分区：" + "、".join(missing))
             images = {
                 name: build_image(payload, data_start, data_size, block_size, partition)
                 for name, partition in partitions.items() if name in PARTITIONS
@@ -190,25 +190,32 @@ def extract(archive_path, output_dir=None, list_only=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract engineering_cdt and abl from an Android OTA ZIP.")
-    parser.add_argument("zip", nargs="?", help="Absolute path to the OTA ZIP")
-    parser.add_argument("--output", type=Path, help="New directory for the two verified images")
-    parser.add_argument("--list", action="store_true", help="Check manifest membership only")
+    reboot_note = "手机端完成 OTA 安装、Magisk 安装和镜像写入校验后，请回到系统升级页面点「重启」。"
+    parser = argparse.ArgumentParser(
+        description="从 Android OTA 全量 ZIP 提取 engineering_cdt.img 和 abl.img，并校验 SHA-256。",
+        epilog=reboot_note,
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="help", help="显示用法和参数说明")
+    parser.add_argument("zip", nargs="?", metavar="OTA_ZIP", help="OTA ZIP 的绝对路径，省略时交互输入")
+    parser.add_argument("--output", type=Path, metavar="目录", help="输出到尚不存在的目录，默认在 ZIP 同目录创建 <包名>_images")
+    parser.add_argument("--list", action="store_true", help="只检查清单是否包含这两个分区")
     args = parser.parse_args()
     try:
-        entered = args.zip or input("Absolute path to OTA ZIP: ")
+        entered = args.zip or input("请输入 OTA ZIP 的绝对路径：")
         path = Path(entered.strip().strip(chr(34)).strip(chr(39)))
         if not path.is_absolute():
-            raise ValueError("Enter an absolute ZIP path")
+            raise ValueError("请输入 OTA ZIP 的绝对路径")
         results = extract(path, args.output, args.list)
         if args.list:
             for name, present in results.items():
-                print(f"{name}: {'present' if present else 'absent'}")
+                print(f"{name}：{'存在' if present else '缺失'}")
         else:
             for image_path, (size, digest) in results.items():
-                print(f"{image_path} ({size:,} bytes)\nSHA-256 {digest}")
+                print(f"{image_path}（{size:,} 字节）\nSHA-256 {digest}")
+            print(reboot_note)
     except (OSError, ValueError, TypeError, EOFError, BadZipFile, lzma.LZMAError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print(f"错误：{error}", file=sys.stderr)
         return 1
     return 0
 
